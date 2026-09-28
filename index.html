@@ -1,0 +1,895 @@
+from flask import Flask, request, jsonify, send_from_directory, render_template_string
+import sqlite3, jwt, bcrypt, re, os, json, datetime, random
+from functools import wraps
+
+app = Flask(__name__)
+SECRET = 'noor_haven_secret_2026'
+DB_PATH = 'noorhaven.db'
+
+# ============================================================
+# DATABASE SETUP — Real SQLite Database
+# ============================================================
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+    c.executescript('''
+        CREATE TABLE IF NOT EXISTS customers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL, phone TEXT, address TEXT, city TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS admins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL, password TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL, description TEXT, category TEXT,
+            fabric TEXT, color TEXT, base_price REAL NOT NULL,
+            discount_price REAL, image TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS product_sizes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL, size TEXT NOT NULL,
+            stock INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_number TEXT UNIQUE NOT NULL,
+            customer_id INTEGER NOT NULL, total REAL NOT NULL,
+            payment_status TEXT DEFAULT 'Pending',
+            order_status TEXT DEFAULT 'Processing',
+            shipping_status TEXT DEFAULT 'Not Shipped',
+            delivery_info TEXT,
+            order_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(customer_id) REFERENCES customers(id)
+        );
+        CREATE TABLE IF NOT EXISTS order_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
+            product_name TEXT, size TEXT, color TEXT,
+            quantity INTEGER NOT NULL, price REAL NOT NULL,
+            FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
+            FOREIGN KEY(product_id) REFERENCES products(id)
+        );
+        CREATE TABLE IF NOT EXISTS cart (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
+            size TEXT, color TEXT, quantity INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+            FOREIGN KEY(product_id) REFERENCES products(id)
+        );
+        CREATE TABLE IF NOT EXISTS wishlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
+            FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+            FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+        );
+    ''')
+    # Seed data (only once)
+    if c.execute('SELECT COUNT(*) FROM admins').fetchone()[0] == 0:
+        c.execute('INSERT INTO admins (username, password) VALUES (?,?)',
+                  ('admin', bcrypt.hashpw(b'admin123', bcrypt.gensalt()).decode()))
+        c.execute('INSERT INTO customers (name,email,password,phone,address,city) VALUES (?,?,?,?,?,?)',
+                  ('Ayesha Khan','ayesha@example.com',
+                   bcrypt.hashpw(b'customer123', bcrypt.gensalt()).decode(),
+                   '03001234567','House 12, Gulberg','Lahore'))
+        products = [
+            ('Cream White Silk Embroidered Dress','Elegant cream silk with hand embroidery','Formal','Pure Silk','Cream White',14500,12500,'https://images.unsplash.com/photo-1595777457583-95e059d581b8?w=500'),
+            ('Royal Blue Chiffon Party Wear','Royal blue chiffon with sequin work','Party Wear','Chiffon','Royal Blue',18500,None,'https://images.unsplash.com/photo-1566174053879-31528523f8ae?w=500'),
+            ('Pastel Pink Lawn Summer','Lightweight pastel pink lawn with florals','Lawn','Lawn','Pastel Pink',4500,3800,'https://images.unsplash.com/photo-1583496661160-fb5886a0aaaa?w=500'),
+            ('Emerald Green Velvet Bridal','Luxurious emerald velvet with gold zari','Bridal','Velvet','Emerald Green',85000,75000,'https://images.unsplash.com/photo-1617627143750-d86bc21e42bb?w=500'),
+            ('Ivory Organza Wedding Gown','Pure ivory organza with pearl detailing','Bridal','Organza','Ivory',120000,None,'https://images.unsplash.com/photo-1594552072238-b8a33785b261?w=500'),
+            ('Crimson Red Silk Festive','Vibrant crimson silk with mirror work','Festive','Silk','Crimson Red',22000,19500,'https://images.unsplash.com/photo-1591369822096-ffd140797c73?w=500'),
+            ('Sky Blue Cotton Casual','Comfortable sky blue cotton with pockets','Casual','Cotton','Sky Blue',3200,2800,'https://images.unsplash.com/photo-1572804013309-59a88b7e92f1?w=500'),
+            ('Golden Yellow Chiffon Eid','Radiant golden chiffon with thread work','Eid','Chiffon','Golden Yellow',16500,14500,'https://images.unsplash.com/photo-1617059003793-8a86b16b6430?w=500'),
+        ]
+        for p in products:
+            c.execute('INSERT INTO products (name,description,category,fabric,color,base_price,discount_price,image) VALUES (?,?,?,?,?,?,?,?)', p)
+            pid = c.lastrowid
+            for s in ['XS','S','M','L','XL']:
+                c.execute('INSERT INTO product_sizes (product_id,size,stock) VALUES (?,?,?)',
+                          (pid, s, random.randint(2,9)))
+        c.execute("INSERT INTO orders (order_number,customer_id,total,payment_status,order_status,shipping_status,delivery_info) VALUES (?,?,?,?,?,?,?)",
+                  ('NH1025',1,18500,'Confirmed','Shipped','In Transit','Expected delivery: Oct 2, 2026 via TCS'))
+        c.execute("INSERT INTO order_items (order_id,product_id,product_name,size,color,quantity,price) VALUES (?,?,?,?,?,?,?)",
+                  (1,2,'Royal Blue Chiffon Party Wear','M','Royal Blue',1,18500))
+        conn.commit()
+        print('✅ Database seeded')
+    conn.close()
+
+# ============================================================
+# AUTH HELPERS
+# ============================================================
+def token_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get('Authorization','').replace('Bearer ','')
+        if not token: return jsonify({'error':'Not authenticated'}), 401
+        try:
+            request.user = jwt.decode(token, SECRET, algorithms=['HS256'])
+        except: return jsonify({'error':'Invalid token'}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get('Authorization','').replace('Bearer ','')
+        if not token: return jsonify({'error':'Admin auth required'}), 401
+        try:
+            u = jwt.decode(token, SECRET, algorithms=['HS256'])
+            if u.get('role') != 'admin': return jsonify({'error':'Forbidden'}), 403
+            request.user = u
+        except: return jsonify({'error':'Invalid admin token'}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+# ============================================================
+# AUTH ROUTES
+# ============================================================
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    d = request.json
+    if not all(k in d for k in ['name','email','password']):
+        return jsonify({'error':'Missing fields'}), 400
+    conn = get_db()
+    try:
+        h = bcrypt.hashpw(d['password'].encode(), bcrypt.gensalt()).decode()
+        cur = conn.execute('INSERT INTO customers (name,email,password,phone) VALUES (?,?,?,?)',
+                           (d['name'], d['email'], h, d.get('phone')))
+        conn.commit()
+        token = jwt.encode({'id':cur.lastrowid,'role':'customer','name':d['name']}, SECRET, algorithm='HS256')
+        return jsonify({'token':token,'user':{'id':cur.lastrowid,'name':d['name'],'email':d['email']}})
+    except: return jsonify({'error':'Email exists'}), 400
+    finally: conn.close()
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    d = request.json
+    conn = get_db()
+    c = conn.execute('SELECT * FROM customers WHERE email=?', (d['email'],)).fetchone()
+    conn.close()
+    if not c or not bcrypt.checkpw(d['password'].encode(), c['password'].encode()):
+        return jsonify({'error':'Invalid credentials'}), 401
+    token = jwt.encode({'id':c['id'],'role':'customer','name':c['name']}, SECRET, algorithm='HS256')
+    return jsonify({'token':token,'user':{'id':c['id'],'name':c['name'],'email':c['email']}})
+
+@app.route('/api/auth/admin', methods=['POST'])
+def admin_login():
+    d = request.json
+    conn = get_db()
+    a = conn.execute('SELECT * FROM admins WHERE username=?', (d['username'],)).fetchone()
+    conn.close()
+    if not a or not bcrypt.checkpw(d['password'].encode(), a['password'].encode()):
+        return jsonify({'error':'Invalid admin'}), 401
+    token = jwt.encode({'id':a['id'],'role':'admin'}, SECRET, algorithm='HS256')
+    return jsonify({'token':token})
+
+# ============================================================
+# PRODUCT ROUTES (Live from DB)
+# ============================================================
+@app.route('/api/products')
+def get_products():
+    conn = get_db()
+    products = conn.execute('SELECT * FROM products').fetchall()
+    result = []
+    for p in products:
+        sizes = conn.execute('SELECT * FROM product_sizes WHERE product_id=?', (p['id'],)).fetchall()
+        result.append({**dict(p),
+            'sizes':[dict(s) for s in sizes],
+            'finalPrice': p['discount_price'] or p['base_price'],
+            'totalStock': sum(s['stock'] for s in sizes)})
+    conn.close()
+    return jsonify(result)
+
+@app.route('/api/products/<int:pid>')
+def get_product(pid):
+    conn = get_db()
+    p = conn.execute('SELECT * FROM products WHERE id=?', (pid,)).fetchone()
+    if not p: return jsonify({'error':'Not found'}), 404
+    sizes = conn.execute('SELECT * FROM product_sizes WHERE product_id=?', (pid,)).fetchall()
+    conn.close()
+    return jsonify({**dict(p), 'sizes':[dict(s) for s in sizes],
+        'finalPrice': p['discount_price'] or p['base_price'],
+        'totalStock': sum(s['stock'] for s in sizes)})
+
+# ============================================================
+# CART ROUTES
+# ============================================================
+@app.route('/api/cart')
+@token_required
+def get_cart():
+    conn = get_db()
+    items = conn.execute('''SELECT c.*, p.name, p.image, p.discount_price, p.base_price
+        FROM cart c JOIN products p ON c.product_id=p.id WHERE c.customer_id=?''',
+        (request.user['id'],)).fetchall()
+    conn.close()
+    total = sum(((i['discount_price'] or i['base_price']) * i['quantity']) for i in items)
+    return jsonify({'items':[dict(i) for i in items], 'total':total})
+
+@app.route('/api/cart', methods=['POST'])
+@token_required
+def add_to_cart():
+    d = request.json
+    conn = get_db()
+    ex = conn.execute('SELECT * FROM cart WHERE customer_id=? AND product_id=? AND size=? AND color=?',
+        (request.user['id'], d['product_id'], d.get('size'), d.get('color'))).fetchone()
+    if ex:
+        conn.execute('UPDATE cart SET quantity=quantity+? WHERE id=?', (d.get('quantity',1), ex['id']))
+    else:
+        conn.execute('INSERT INTO cart (customer_id,product_id,size,color,quantity) VALUES (?,?,?,?,?)',
+            (request.user['id'], d['product_id'], d.get('size'), d.get('color'), d.get('quantity',1)))
+    conn.commit(); conn.close()
+    return jsonify({'success':True})
+
+@app.route('/api/cart/<int:cid>', methods=['DELETE'])
+@token_required
+def remove_cart(cid):
+    conn = get_db()
+    conn.execute('DELETE FROM cart WHERE id=? AND customer_id=?', (cid, request.user['id']))
+    conn.commit(); conn.close()
+    return jsonify({'success':True})
+
+# ============================================================
+# ORDER ROUTES
+# ============================================================
+@app.route('/api/orders')
+@token_required
+def get_orders():
+    conn = get_db()
+    orders = conn.execute('SELECT * FROM orders WHERE customer_id=? ORDER BY order_date DESC',
+                          (request.user['id'],)).fetchall()
+    conn.close()
+    return jsonify([dict(o) for o in orders])
+
+@app.route('/api/orders/<num>')
+def get_order(num):
+    conn = get_db()
+    o = conn.execute('SELECT * FROM orders WHERE order_number=?', (num,)).fetchone()
+    if not o: return jsonify({'error':'Order not found'}), 404
+    items = conn.execute('SELECT * FROM order_items WHERE order_id=?', (o['id'],)).fetchall()
+    cust = conn.execute('SELECT name,email FROM customers WHERE id=?', (o['customer_id'],)).fetchone()
+    conn.close()
+    return jsonify({**dict(o), 'items':[dict(i) for i in items], 'customer':dict(cust)})
+
+@app.route('/api/checkout', methods=['POST'])
+@token_required
+def checkout():
+    conn = get_db()
+    cart = conn.execute('SELECT * FROM cart WHERE customer_id=?', (request.user['id'],)).fetchall()
+    if not cart: return jsonify({'error':'Cart empty'}), 400
+    order_number = 'NH' + str(random.randint(1000,9999))
+    total = 0
+    try:
+        for item in cart:
+            s = conn.execute('SELECT stock FROM product_sizes WHERE product_id=? AND size=?',
+                             (item['product_id'], item['size'])).fetchone()
+            if not s or s['stock'] < item['quantity']:
+                raise Exception(f"Insufficient stock for size {item['size']}")
+            p = conn.execute('SELECT base_price,discount_price FROM products WHERE id=?',
+                             (item['product_id'],)).fetchone()
+            total += (p['discount_price'] or p['base_price']) * item['quantity']
+        cur = conn.execute('''INSERT INTO orders (order_number,customer_id,total,payment_status,order_status,shipping_status)
+            VALUES (?,?,?,'Confirmed','Processing','Not Shipped')''', (order_number, request.user['id'], total))
+        for item in cart:
+            p = conn.execute('SELECT * FROM products WHERE id=?', (item['product_id'],)).fetchone()
+            conn.execute('''INSERT INTO order_items (order_id,product_id,product_name,size,color,quantity,price)
+                VALUES (?,?,?,?,?,?,?)''', (cur.lastrowid, item['product_id'], p['name'],
+                item['size'], item['color'], item['quantity'], p['discount_price'] or p['base_price']))
+            conn.execute('UPDATE product_sizes SET stock=stock-? WHERE product_id=? AND size=?',
+                         (item['quantity'], item['product_id'], item['size']))
+        conn.execute('DELETE FROM cart WHERE customer_id=?', (request.user['id'],))
+        conn.commit()
+        return jsonify({'success':True, 'orderNumber':order_number, 'total':total})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error':str(e)}), 400
+    finally: conn.close()
+
+# ============================================================
+# ADMIN ROUTES
+# ============================================================
+@app.route('/api/admin/products')
+@admin_required
+def admin_products():
+    conn = get_db()
+    products = conn.execute('SELECT * FROM products').fetchall()
+    sizes = conn.execute('SELECT * FROM product_sizes').fetchall()
+    conn.close()
+    return jsonify([{**dict(p), 'sizes':[dict(s) for s in sizes if s['product_id']==p['id']]} for p in products])
+
+@app.route('/api/admin/products', methods=['POST'])
+@admin_required
+def admin_add_product():
+    d = request.json
+    conn = get_db()
+    cur = conn.execute('''INSERT INTO products (name,description,category,fabric,color,base_price,discount_price,image)
+        VALUES (?,?,?,?,?,?,?,?)''', (d['name'],d.get('description'),d.get('category'),d.get('fabric'),
+        d.get('color'),d['base_price'],d.get('discount_price'),d.get('image')))
+    if d.get('sizes'):
+        for s in d['sizes']:
+            conn.execute('INSERT INTO product_sizes (product_id,size,stock) VALUES (?,?,?)',
+                         (cur.lastrowid, s['size'], s['stock']))
+    conn.commit(); conn.close()
+    return jsonify({'success':True})
+
+@app.route('/api/admin/products/<int:pid>', methods=['PUT'])
+@admin_required
+def admin_update_product(pid):
+    d = request.json
+    conn = get_db()
+    conn.execute('''UPDATE products SET name=?,description=?,category=?,fabric=?,color=?,
+        base_price=?,discount_price=?,image=? WHERE id=?''',
+        (d['name'],d.get('description'),d.get('category'),d.get('fabric'),d.get('color'),
+         d['base_price'],d.get('discount_price'),d.get('image'),pid))
+    conn.commit(); conn.close()
+    return jsonify({'success':True})
+
+@app.route('/api/admin/stock/<int:pid>/<size>', methods=['PUT'])
+@admin_required
+def admin_update_stock(pid, size):
+    conn = get_db()
+    conn.execute('UPDATE product_sizes SET stock=? WHERE product_id=? AND size=?',
+                 (request.json['stock'], pid, size))
+    conn.commit(); conn.close()
+    return jsonify({'success':True})
+
+@app.route('/api/admin/products/<int:pid>', methods=['DELETE'])
+@admin_required
+def admin_delete_product(pid):
+    conn = get_db()
+    conn.execute('DELETE FROM products WHERE id=?', (pid,))
+    conn.commit(); conn.close()
+    return jsonify({'success':True})
+
+@app.route('/api/admin/orders')
+@admin_required
+def admin_orders():
+    conn = get_db()
+    orders = conn.execute('''SELECT o.*, c.name as customer_name, c.email as customer_email
+        FROM orders o JOIN customers c ON o.customer_id=c.id ORDER BY o.order_date DESC''').fetchall()
+    conn.close()
+    return jsonify([dict(o) for o in orders])
+
+@app.route('/api/admin/orders/<int:oid>/status', methods=['PUT'])
+@admin_required
+def admin_update_order_status(oid):
+    d = request.json
+    conn = get_db()
+    conn.execute('UPDATE orders SET order_status=?,shipping_status=?,delivery_info=? WHERE id=?',
+                 (d.get('order_status'),d.get('shipping_status'),d.get('delivery_info'),oid))
+    conn.commit(); conn.close()
+    return jsonify({'success':True})
+
+# ============================================================
+# 🤖 AI CHATBOT ENGINE — Queries REAL Database
+# ============================================================
+@app.route('/api/chat', methods=['POST'])
+@token_required
+def chat():
+    msg = request.json.get('message','')
+    reply = process_chat(msg.lower(), msg, request.user['id'], request.user.get('name'))
+    return jsonify({'reply': reply})
+
+def process_chat(lower, original, user_id, user_name):
+    # ORDER TRACKING
+    order_match = re.search(r'NH\d{4,}', original, re.I) or re.search(r'order\s*#?\s*(\w+)', lower)
+    if order_match or any(k in lower for k in ['where is my order','track my order','order status','my order']):
+        num = order_match.group(0) if order_match and order_match.group(0).upper().startswith('NH') else None
+        if not num and order_match: num = 'NH' + order_match.group(1)
+        if num:
+            conn = get_db()
+            o = conn.execute('SELECT * FROM orders WHERE order_number=? AND customer_id=?', (num, user_id)).fetchone()
+            if not o:
+                conn.close()
+                return f"❌ I couldn't find order {num} in your account."
+            items = conn.execute('SELECT * FROM order_items WHERE order_id=?', (o['id'],)).fetchall()
+            conn.close()
+            msg = f"📦 **Order {o['order_number']}**\n"
+            msg += f"📅 Date: {o['order_date'][:10]}\n💰 Total: PKR {int(o['total']):,}\n"
+            msg += f"💳 Payment: {o['payment_status']}\n📋 Status: {o['order_status']}\n"
+            msg += f"🚚 Shipping: {o['shipping_status']}\n"
+            if o['delivery_info']: msg += f"📍 {o['delivery_info']}\n"
+            msg += "\n**Items:**\n"
+            for i in items:
+                msg += f"• {i['product_name']} ({i['size']}/{i['color']}) × {i['quantity']} — PKR {int(i['price']):,}\n"
+            return msg
+        conn = get_db()
+        orders = conn.execute('SELECT * FROM orders WHERE customer_id=? ORDER BY order_date DESC LIMIT 5', (user_id,)).fetchall()
+        conn.close()
+        if not orders: return "You don't have any orders yet. Would you like to browse our collection?"
+        msg = "📋 **Your recent orders:**\n"
+        for o in orders: msg += f"• {o['order_number']} — PKR {int(o['total']):,} — {o['order_status']}\n"
+        return msg
+
+    # CART QUERIES
+    if any(k in lower for k in ['my cart','what\'s in my cart','show cart','view cart']):
+        conn = get_db()
+        items = conn.execute('''SELECT c.*, p.name, p.image, p.discount_price, p.base_price
+            FROM cart c JOIN products p ON c.product_id=p.id WHERE c.customer_id=?''', (user_id,)).fetchall()
+        conn.close()
+        if not items: return "🛒 Your cart is empty. Would you like me to show you our latest collection?"
+        total = 0; msg = "🛒 **Your Cart:**\n"
+        for i in items:
+            price = i['discount_price'] or i['base_price']
+            total += price * i['quantity']
+            msg += f"• {i['name']} ({i['size']}/{i['color']}) × {i['quantity']} — PKR {int(price*i['quantity']):,}\n"
+        return msg + f"\n💰 **Total: PKR {int(total):,}**"
+
+    # ADD TO CART
+    if 'add' in lower and ('to cart' in lower or 'to my cart' in lower):
+        prod_name = re.sub(r'add|to\s*(my)?\s*cart|this|that|the|please|kindly', '', original, flags=re.I).strip()
+        conn = get_db()
+        product = None
+        if prod_name:
+            product = conn.execute('SELECT * FROM products WHERE LOWER(name) LIKE ?', (f'%{prod_name.lower()}%',)).fetchone()
+        if not product:
+            products = conn.execute('SELECT * FROM products').fetchall()
+            conn.close()
+            return "Which product would you like to add?\n" + \
+                '\n'.join([f"• {p['name']} — PKR {int(p['discount_price'] or p['base_price']):,}" for p in products[:4]])
+        sizes = conn.execute('SELECT * FROM product_sizes WHERE product_id=? AND stock>0', (product['id'],)).fetchall()
+        if not sizes:
+            conn.close()
+            return f"❌ Sorry, \"{product['name']}\" is currently out of stock."
+        size_match = re.search(r'\b(XS|S|M|L|XL)\b', original, re.I)
+        size = size_match.group(1).upper() if size_match else sizes[0]['size']
+        size_row = next((s for s in sizes if s['size']==size), None)
+        if not size_row:
+            conn.close()
+            return f"Size {size} is not available. Available: {', '.join(s['size'] for s in sizes)}"
+        conn.execute('INSERT INTO cart (customer_id,product_id,size,color,quantity) VALUES (?,?,?,?,1)',
+                     (user_id, product['id'], size, product['color']))
+        conn.commit(); conn.close()
+        return f"✅ Added **{product['name']}** (Size {size}) to your cart! Price: PKR {int(product['discount_price'] or product['base_price']):,}"
+
+    # PRODUCT SEARCH
+    if any(k in lower for k in ['show','find','dress','silk','cotton','chiffon','under','category','velvet','lawn']):
+        conn = get_db()
+        conditions = []; params = []
+        price_match = re.search(r'under\s*(?:pkr|rs\.?|\s)?\s*(\d[\d,]*)', original, re.I)
+        if price_match:
+            conditions.append('(COALESCE(discount_price, base_price) <= ?)')
+            params.append(int(price_match.group(1).replace(',','')))
+        for f in ['silk','chiffon','lawn','cotton','velvet','organza']:
+            if f in lower: conditions.append('LOWER(fabric) LIKE ?'); params.append(f'%{f}%')
+        for c in ['cream','white','blue','pink','red','green','ivory','golden','yellow','crimson','emerald','royal','pastel']:
+            if c in lower: conditions.append('LOWER(color) LIKE ?'); params.append(f'%{c}%')
+        for cat in ['bridal','party','formal','casual','festive','eid','lawn']:
+            if cat in lower: conditions.append('LOWER(category) LIKE ?'); params.append(f'%{cat}%')
+        sql = 'SELECT * FROM products' + (' WHERE ' + ' AND '.join(conditions) if conditions else '') + ' LIMIT 6'
+        products = conn.execute(sql, params).fetchall()
+        if not products:
+            conn.close()
+            return "I couldn't find any products matching your criteria. Try 'show silk dresses' or 'dresses under PKR 20,000'."
+        msg = f"✨ Found {len(products)} product(s):\n\n"
+        for p in products:
+            sizes = conn.execute('SELECT * FROM product_sizes WHERE product_id=?', (p['id'],)).fetchall()
+            total_stock = sum(s['stock'] for s in sizes)
+            avail = ', '.join(s['size'] for s in sizes if s['stock']>0)
+            price = p['discount_price'] or p['base_price']
+            disc = f" ~~PKR {int(p['base_price']):,}~~ → **PKR {int(price):,}**" if p['discount_price'] else f"PKR {int(price):,}"
+            msg += f"👗 **{p['name']}**\n   💰 {disc}\n   📏 Sizes: {avail or 'None'}\n"
+            msg += f"   📦 Stock: {total_stock if total_stock>0 else '❌ Out of stock'} available\n"
+            msg += f"   🎨 {p['color']} | {p['fabric']}\n\n"
+        conn.close()
+        return msg + "Say \"add [product name] size M to cart\" to purchase!"
+
+    # WISHLIST
+    if any(k in lower for k in ['wishlist','saved']):
+        conn = get_db()
+        items = conn.execute('''SELECT p.name, p.discount_price, p.base_price FROM wishlist w
+            JOIN products p ON w.product_id=p.id WHERE w.customer_id=?''', (user_id,)).fetchall()
+        conn.close()
+        if not items: return "Your wishlist is empty. Browse products and save your favorites!"
+        return "❤️ **Your Wishlist:**\n" + '\n'.join([f"• {i['name']} — PKR {int(i['discount_price'] or i['base_price']):,}" for i in items])
+
+    # ACCOUNT
+    if any(k in lower for k in ['my account','my profile','my address']):
+        conn = get_db()
+        c = conn.execute('SELECT name,email,phone,address,city FROM customers WHERE id=?', (user_id,)).fetchone()
+        conn.close()
+        return f"👤 **Your Account**\n• Name: {c['name']}\n• Email: {c['email']}\n• Phone: {c['phone'] or 'Not set'}\n• Address: {c['address'] or 'Not set'}, {c['city'] or ''}"
+
+    # GREETINGS
+    if re.match(r'^(hi|hello|hey|salam|assalam)', lower):
+        return f"Assalam-o-Alaikum {user_name or 'there'}! 👋 I'm your Noor Haven assistant. I can:\n\n• 🔍 Find dresses\n• 🛒 Manage cart\n• 📦 Track orders\n• ❤️ View wishlist\n\nWhat would you like today?"
+    if 'help' in lower or 'what can you do' in lower:
+        return "I can search products, check stock, add to cart, track orders, and manage your account. Just ask naturally!"
+    return "I didn't quite catch that. Try:\n• 'Show cream silk dresses under PKR 15,000'\n• 'Add to cart'\n• 'Where is my order NH1025?'\n• 'What's in my cart?'"
+
+# ============================================================
+# FRONTEND — Embedded HTML/CSS/JS (Animated)
+# ============================================================
+HTML_TEMPLATE = '''<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Noor Haven</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',sans-serif}
+body{background:#fdf8f3;color:#2c1810}
+.navbar{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);padding:1rem 3rem;display:flex;justify-content:space-between;align-items:center;box-shadow:0 2px 20px rgba(0,0,0,0.05)}
+.logo{font-size:1.8rem;font-weight:bold;color:#8b6f47}.logo span{color:#d4af37}
+.nav-links a{margin-left:2rem;text-decoration:none;color:#2c1810;font-weight:500;cursor:pointer;transition:.3s}
+.nav-links a:hover{color:#d4af37}
+.hero{min-height:100vh;background:linear-gradient(135deg,#fdf8f3,#f5e6d3,#e8d5b7);display:flex;align-items:center;justify-content:center;text-align:center;padding-top:80px;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;width:500px;height:500px;background:radial-gradient(circle,rgba(212,175,55,0.2),transparent);border-radius:50%;top:-100px;right:-100px;animation:float 8s ease-in-out infinite}
+@keyframes float{0%,100%{transform:translate(0,0)}50%{transform:translate(-30px,30px)}}
+.hero h1{font-size:4rem;color:#2c1810;margin-bottom:1rem;animation:fadeInUp 1s ease}
+.hero h1 .gold{color:#d4af37;font-style:italic}
+.hero p{font-size:1.3rem;color:#6b5544;margin-bottom:2rem;animation:fadeInUp 1s ease .3s both}
+@keyframes fadeInUp{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:translateY(0)}}
+.btn-primary{background:linear-gradient(135deg,#d4af37,#b8941f);color:white;border:none;padding:1rem 2.5rem;font-size:1.1rem;border-radius:50px;cursor:pointer;transition:.3s;box-shadow:0 4px 15px rgba(212,175,55,0.4)}
+.btn-primary:hover{transform:translateY(-3px);box-shadow:0 8px 25px rgba(212,175,55,0.6)}
+.btn-secondary{background:transparent;border:2px solid #8b6f47;color:#8b6f47;padding:.8rem 2rem;border-radius:50px;cursor:pointer;margin-left:1rem;transition:.3s}
+.btn-secondary:hover{background:#8b6f47;color:white}
+.pulse{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{box-shadow:0 4px 15px rgba(212,175,55,0.4)}50%{box-shadow:0 4px 30px rgba(212,175,55,0.8)}}
+.products-section{padding:5rem 3rem}
+.section-title{text-align:center;font-size:2.5rem;color:#2c1810;margin-bottom:2rem}
+.section-title::after{content:'';display:block;width:80px;height:3px;background:#d4af37;margin:1rem auto}
+.filters{display:flex;gap:1rem;justify-content:center;margin-bottom:3rem;flex-wrap:wrap}
+.filters input,.filters select{padding:.8rem 1.5rem;border:2px solid #e8d5b7;border-radius:50px;font-size:1rem;outline:none;transition:.3s}
+.filters input:focus,.filters select:focus{border-color:#d4af37}
+.product-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:2rem;max-width:1400px;margin:0 auto}
+.product-card{background:white;border-radius:20px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.08);transition:.4s;cursor:pointer;animation:fadeInUp .6s ease both}
+.product-card:hover{transform:translateY(-10px);box-shadow:0 15px 40px rgba(0,0,0,0.15)}
+.product-card img{width:100%;height:350px;object-fit:cover;transition:.4s}
+.product-card:hover img{transform:scale(1.05)}
+.product-info{padding:1.5rem}
+.product-info h3{font-size:1.2rem;margin-bottom:.5rem;color:#2c1810}
+.product-info .price{color:#d4af37;font-size:1.3rem;font-weight:bold}
+.product-info .old-price{text-decoration:line-through;color:#999;margin-right:.5rem;font-size:1rem}
+.product-info .stock{font-size:.9rem;color:#6b5544;margin-top:.5rem}
+.chat-toggle{position:fixed;bottom:30px;right:30px;width:65px;height:65px;border-radius:50%;background:linear-gradient(135deg,#d4af37,#b8941f);color:white;border:none;font-size:1.8rem;cursor:pointer;box-shadow:0 5px 25px rgba(212,175,55,0.5);z-index:99;animation:bounce 2s infinite}
+@keyframes bounce{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}
+.chatbot{position:fixed;bottom:110px;right:30px;width:380px;height:550px;background:white;border-radius:20px;box-shadow:0 10px 50px rgba(0,0,0,0.2);display:flex;flex-direction:column;z-index:99;overflow:hidden;animation:slideUp .3s ease}
+@keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+.chat-header{background:linear-gradient(135deg,#8b6f47,#6b5544);color:white;padding:1rem;display:flex;align-items:center;gap:.8rem}
+.chat-avatar{width:40px;height:40px;background:white;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.3rem}
+.chat-title{font-weight:bold}.chat-status{font-size:.75rem;opacity:.9}
+.close-btn{margin-left:auto;background:none;border:none;color:white;font-size:1.5rem;cursor:pointer}
+.chat-messages{flex:1;padding:1rem;overflow-y:auto;background:#fdf8f3}
+.msg{margin-bottom:1rem;max-width:85%;padding:.8rem 1rem;border-radius:15px;animation:fadeIn .3s ease;line-height:1.5;white-space:pre-wrap}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.msg.bot{background:white;box-shadow:0 2px 8px rgba(0,0,0,0.05);border-bottom-left-radius:5px}
+.msg.user{background:linear-gradient(135deg,#d4af37,#b8941f);color:white;margin-left:auto;border-bottom-right-radius:5px}
+.chat-input-area{display:flex;padding:.8rem;border-top:1px solid #eee;background:white}
+.chat-input-area input{flex:1;padding:.7rem 1rem;border:2px solid #e8d5b7;border-radius:25px;outline:none}
+.chat-input-area input:focus{border-color:#d4af37}
+.chat-input-area button{background:linear-gradient(135deg,#d4af37,#b8941f);color:white;border:none;width:45px;height:45px;border-radius:50%;margin-left:.5rem;cursor:pointer;font-size:1.2rem}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:200;animation:fadeIn .3s}
+.modal-content{background:white;padding:2rem;border-radius:20px;max-width:500px;width:90%;max-height:90vh;overflow-y:auto}
+.modal-content.large{max-width:900px}
+.modal-content h2{margin-bottom:1.5rem;color:#2c1810}
+.modal-content input{width:100%;padding:.8rem;margin-bottom:1rem;border:2px solid #e8d5b7;border-radius:10px;outline:none}
+.modal-content input:focus{border-color:#d4af37}
+.modal-content .btn-primary,.modal-content .btn-secondary{width:100%;margin:.5rem 0}
+.hidden{display:none!important}
+.cart-item{display:flex;gap:1rem;padding:1rem;border-bottom:1px solid #eee;align-items:center}
+.cart-item img{width:70px;height:70px;object-fit:cover;border-radius:10px}
+.cart-item-info{flex:1}
+.cart-total{font-size:1.3rem;font-weight:bold;text-align:right;margin:1rem 0;color:#d4af37}
+footer{background:#2c1810;color:#d4af37;text-align:center;padding:2rem;margin-top:3rem}
+footer a{color:#d4af37;margin-left:1rem}
+@media(max-width:768px){.hero h1{font-size:2.5rem}.chatbot{width:calc(100% - 20px);right:10px}.navbar{padding:1rem}}
+</style></head>
+<body>
+<nav class="navbar">
+  <div class="logo">✨ Noor <span>Haven</span></div>
+  <div class="nav-links">
+    <a onclick="scrollTo({top:0,behavior:'smooth'})">Home</a>
+    <a onclick="document.getElementById('products').scrollIntoView({behavior:'smooth'})">Shop</a>
+    <a onclick="openCart()">Cart (<span id="cart-count">0</span>)</a>
+    <a id="auth-link" onclick="openAuth()">Login</a>
+  </div>
+</nav>
+<section class="hero">
+  <div>
+    <h1>Timeless Elegance,<br><span class="gold">Crafted for You</span></h1>
+    <p>Discover our exclusive collection of premium fashion — powered by live database AI</p>
+    <button class="btn-primary pulse" onclick="document.getElementById('products').scrollIntoView({behavior:'smooth'})">Shop Collection</button>
+  </div>
+</section>
+<section id="products" class="products-section">
+  <h2 class="section-title">Our Collection</h2>
+  <div class="filters">
+    <input type="text" id="search" placeholder="🔍 Search dresses..." oninput="filterProducts()">
+    <select id="cat-filter" onchange="filterProducts()">
+      <option value="">All Categories</option>
+      <option>Bridal</option><option>Party Wear</option><option>Formal</option>
+      <option>Casual</option><option>Lawn</option><option>Festive</option><option>Eid</option>
+    </select>
+  </div>
+  <div id="product-grid" class="product-grid"></div>
+</section>
+<button class="chat-toggle" onclick="toggleChat()">💬</button>
+<div id="chatbot" class="chatbot hidden">
+  <div class="chat-header">
+    <div class="chat-avatar">🤖</div>
+    <div><div class="chat-title">Noor Assistant</div><div class="chat-status">● Live Database Connected</div></div>
+    <button onclick="toggleChat()" class="close-btn">×</button>
+  </div>
+  <div id="chat-messages" class="chat-messages"></div>
+  <div class="chat-input-area">
+    <input type="text" id="chat-input" placeholder="Ask me anything..." onkeypress="if(event.key==='Enter')sendChat()">
+    <button onclick="sendChat()">➤</button>
+  </div>
+</div>
+<div id="cart-modal" class="modal hidden"><div class="modal-content">
+  <h2>🛒 Your Cart</h2><div id="cart-items"></div>
+  <div class="cart-total">Total: <span id="cart-total">PKR 0</span></div>
+  <button class="btn-primary" onclick="checkout()">Checkout</button>
+  <button class="btn-secondary" onclick="closeModal('cart-modal')">Continue Shopping</button>
+</div></div>
+<div id="auth-modal" class="modal hidden"><div class="modal-content">
+  <h2 id="auth-title">Login</h2>
+  <input type="text" id="auth-name" placeholder="Name" style="display:none">
+  <input type="email" id="auth-email" placeholder="Email">
+  <input type="password" id="auth-pass" placeholder="Password">
+  <button class="btn-primary" onclick="submitAuth()">Continue</button>
+  <p id="auth-switch">New here? <a href="#" onclick="toggleAuthMode()">Create account</a></p>
+  <p style="margin-top:1rem;font-size:.85rem;color:#888">Demo: ayesha@example.com / customer123</p>
+  <button class="btn-secondary" onclick="closeModal('auth-modal')">Cancel</button>
+</div></div>
+<div id="product-modal" class="modal hidden"><div class="modal-content large" id="product-detail"></div></div>
+<footer><p>© 2026 Noor Haven — Real Database AI Shopping Platform</p><p style="margin-top:.5rem"><a href="/admin">Admin Dashboard</a></p></footer>
+<script>
+let TOKEN=localStorage.getItem('token'),USER=JSON.parse(localStorage.getItem('user')||'null'),PRODUCTS=[];
+if(USER){document.getElementById('auth-link').textContent=USER.name;document.getElementById('auth-link').onclick=logout}
+async function api(url,opt={}){
+  if(TOKEN)opt.headers={...(opt.headers||{}),Authorization:'Bearer '+TOKEN};
+  const r=await fetch(url,opt);return r.json();
+}
+async function loadProducts(){
+  PRODUCTS=await api('/api/products');renderProducts(PRODUCTS);
+}
+function renderProducts(list){
+  const grid=document.getElementById('product-grid');
+  grid.innerHTML=list.map((p,i)=>`
+    <div class="product-card" style="animation-delay:${i*0.1}s" onclick='showProduct(${JSON.stringify(p).replace(/'/g,"&apos;")})'>
+      <img src="${p.image}" onerror="this.src='https://via.placeholder.com/300x350/f5e6d3/8b6f47?text=Noor+Haven'">
+      <div class="product-info">
+        <h3>${p.name}</h3>
+        <div>${p.discount_price?`<span class="old-price">PKR ${p.base_price.toLocaleString()}</span>`:''}<span class="price">PKR ${(p.discount_price||p.base_price).toLocaleString()}</span></div>
+        <div class="stock">${p.totalStock>0?`${p.totalStock} in stock`:'❌ Out of stock'}</div>
+      </div>
+    </div>`).join('');
+}
+function filterProducts(){
+  const q=document.getElementById('search').value.toLowerCase();
+  const cat=document.getElementById('cat-filter').value;
+  renderProducts(PRODUCTS.filter(p=>(!q||p.name.toLowerCase().includes(q))&&(!cat||p.category===cat)));
+}
+function showProduct(p){
+  const availSizes=p.sizes.filter(s=>s.stock>0);
+  document.getElementById('product-detail').innerHTML=`
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:2rem">
+      <img src="${p.image}" style="width:100%;border-radius:15px">
+      <div>
+        <h2>${p.name}</h2>
+        <p style="margin:1rem 0;color:#6b5544">${p.description}</p>
+        <div style="font-size:1.8rem;color:#d4af37;font-weight:bold;margin:1rem 0">
+          ${p.discount_price?`<span style="text-decoration:line-through;color:#999;font-size:1.2rem">PKR ${p.base_price.toLocaleString()}</span> `:''}
+          PKR ${(p.discount_price||p.base_price).toLocaleString()}
+        </div>
+        <p><b>Fabric:</b> ${p.fabric} | <b>Color:</b> ${p.color}</p>
+        <p><b>Category:</b> ${p.category}</p>
+        <div style="margin:1rem 0"><b>Select Size:</b><div id="size-btns" style="display:flex;gap:.5rem;margin-top:.5rem">
+          ${availSizes.map(s=>`<button onclick="selectSize(this,'${s.size}')" style="padding:.5rem 1rem;border:2px solid #d4af37;background:white;border-radius:10px;cursor:pointer">${s.size} (${s.stock})</button>`).join('')}
+        </div></div>
+        <button class="btn-primary" onclick="addToCart(${p.id})">Add to Cart</button>
+        <button class="btn-secondary" onclick="closeModal('product-modal')">Close</button>
+      </div>
+    </div>`;
+  document.getElementById('product-modal').classList.remove('hidden');
+}
+let selectedSize='';
+function selectSize(btn,s){document.querySelectorAll('#size-btns button').forEach(b=>b.style.background='white');btn.style.background='#d4af37';btn.style.color='white';selectedSize=s}
+async function addToCart(pid){
+  if(!TOKEN){openAuth();return}
+  if(!selectedSize){alert('Please select a size');return}
+  const p=PRODUCTS.find(x=>x.id===pid);
+  await api('/api/cart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:pid,size:selectedSize,color:p.color,quantity:1})});
+  alert('✅ Added to cart!');closeModal('product-modal');loadCart();
+}
+async function loadCart(){
+  if(!TOKEN)return;
+  const c=await api('/api/cart');
+  document.getElementById('cart-count').textContent=c.items.reduce((a,i)=>a+i.quantity,0);
+  document.getElementById('cart-items').innerHTML=c.items.map(i=>`
+    <div class="cart-item">
+      <img src="${i.image}">
+      <div class="cart-item-info"><b>${i.name}</b><br>${i.size} / ${i.color} × ${i.quantity}<br>PKR ${((i.discount_price||i.base_price)*i.quantity).toLocaleString()}</div>
+      <button onclick="removeCart(${i.id})" style="background:#e74c3c;color:white;border:none;padding:.5rem 1rem;border-radius:10px;cursor:pointer">×</button>
+    </div>`).join('')||'<p>Your cart is empty</p>';
+  document.getElementById('cart-total').textContent='PKR '+c.total.toLocaleString();
+}
+async function removeCart(id){await api('/api/cart/'+id,{method:'DELETE'});loadCart()}
+async function checkout(){
+  if(!TOKEN){openAuth();return}
+  const r=await api('/api/checkout',{method:'POST'});
+  if(r.success){alert(`✅ Order placed!\\nOrder: ${r.orderNumber}\\nTotal: PKR ${r.total.toLocaleString()}`);closeModal('cart-modal');loadCart()}
+  else alert('❌ '+r.error);
+}
+function openCart(){if(!TOKEN){openAuth();return}document.getElementById('cart-modal').classList.remove('hidden');loadCart()}
+function openAuth(){document.getElementById('auth-modal').classList.remove('hidden')}
+function closeModal(id){document.getElementById(id).classList.add('hidden')}
+let authMode='login';
+function toggleAuthMode(){
+  authMode=authMode==='login'?'register':'login';
+  document.getElementById('auth-title').textContent=authMode==='login'?'Login':'Create Account';
+  document.getElementById('auth-name').style.display=authMode==='register'?'block':'none';
+  document.getElementById('auth-switch').innerHTML=authMode==='login'?'New here? <a href="#" onclick="toggleAuthMode()">Create account</a>':'Have an account? <a href="#" onclick="toggleAuthMode()">Login</a>';
+}
+async function submitAuth(){
+  const email=document.getElementById('auth-email').value,pass=document.getElementById('auth-pass').value;
+  let r;
+  if(authMode==='register'){
+    r=await api('/api/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('auth-name').value,email,password:pass})});
+  }else{
+    r=await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pass})});
+  }
+  if(r.token){TOKEN=r.token;USER=r.user;localStorage.setItem('token',TOKEN);localStorage.setItem('user',JSON.stringify(USER));document.getElementById('auth-link').textContent=USER.name;document.getElementById('auth-link').onclick=logout;closeModal('auth-modal');addBotMsg(`Welcome ${USER.name}! 👋`)}
+  else alert('❌ '+(r.error||'Failed'));
+}
+function logout(){localStorage.clear();TOKEN=null;USER=null;location.reload()}
+function toggleChat(){
+  const c=document.getElementById('chatbot');c.classList.toggle('hidden');
+  if(!c.classList.contains('hidden')&&!document.querySelector('.msg')){
+    if(!TOKEN){addBotMsg('Please login first to chat with me!');setTimeout(openAuth,500);return}
+    addBotMsg(`Assalam-o-Alaikum ${USER.name}! 👋 I'm connected to our live database. Ask me to:\\n• Show dresses\\n• Check your cart\\n• Track orders\\n• Add items to cart`);
+  }
+}
+function addBotMsg(t,who='bot'){
+  const d=document.createElement('div');d.className='msg '+who;d.textContent=t;
+  document.getElementById('chat-messages').appendChild(d);d.scrollIntoView();
+}
+async function sendChat(){
+  const inp=document.getElementById('chat-input');if(!inp.value.trim())return;
+  addBotMsg(inp.value,'user');const msg=inp.value;inp.value='';
+  if(!TOKEN){addBotMsg('Please login first');openAuth();return}
+  const r=await api('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});
+  addBotMsg(r.reply);
+}
+loadProducts();loadCart();
+</script></body></html>'''
+
+ADMIN_TEMPLATE = '''<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Admin — Noor Haven</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',sans-serif}
+body{background:#f5f5f5}
+.login-screen{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#2c1810,#6b5544)}
+.login-box{background:white;padding:2.5rem;border-radius:20px;width:400px;box-shadow:0 10px 40px rgba(0,0,0,0.2)}
+.login-box h2{color:#2c1810;margin-bottom:1.5rem;text-align:center}
+.login-box input{width:100%;padding:.8rem;margin-bottom:1rem;border:2px solid #e8d5b7;border-radius:10px}
+.login-box button{width:100%;padding:.8rem;background:linear-gradient(135deg,#d4af37,#b8941f);color:white;border:none;border-radius:10px;cursor:pointer;font-size:1rem}
+.dashboard{display:none}
+.topbar{background:#2c1810;color:#d4af37;padding:1rem 2rem;display:flex;justify-content:space-between;align-items:center}
+.topbar h1{font-size:1.5rem}
+.topbar button{background:#d4af37;color:#2c1810;border:none;padding:.5rem 1rem;border-radius:8px;cursor:pointer;font-weight:bold}
+.tabs{display:flex;background:white;border-bottom:2px solid #eee}
+.tab{padding:1rem 2rem;cursor:pointer;border-bottom:3px solid transparent;transition:.3s}
+.tab.active{border-bottom-color:#d4af37;color:#d4af37;font-weight:bold}
+.content{padding:2rem}
+table{width:100%;background:white;border-radius:10px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,0.05)}
+th{background:#2c1810;color:#d4af37;padding:1rem;text-align:left}
+td{padding:.8rem 1rem;border-bottom:1px solid #eee}
+.btn{padding:.4rem .8rem;border:none;border-radius:6px;cursor:pointer;margin-right:.3rem;font-size:.85rem}
+.btn-edit{background:#3498db;color:white}.btn-del{background:#e74c3c;color:white}.btn-save{background:#27ae60;color:white}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;background:white;padding:2rem;border-radius:10px;margin-bottom:2rem}
+.form-grid input,.form-grid textarea,.form-grid select{padding:.7rem;border:2px solid #e8d5b7;border-radius:8px}
+.form-grid button{grid-column:1/-1;padding:.8rem;background:linear-gradient(135deg,#d4af37,#b8941f);color:white;border:none;border-radius:8px;cursor:pointer;font-size:1rem}
+select.status{padding:.4rem;border-radius:6px;border:1px solid #ddd}
+</style></head>
+<body>
+<div id="login-screen" class="login-screen">
+  <div class="login-box">
+    <h2>🔐 Admin Login</h2>
+    <input id="username" placeholder="Username" value="admin">
+    <input id="password" type="password" placeholder="Password" value="admin123">
+    <button onclick="adminLogin()">Login</button>
+    <p style="margin-top:1rem;text-align:center;font-size:.85rem;color:#888">Demo: admin / admin123</p>
+  </div>
+</div>
+<div id="dashboard" class="dashboard">
+  <div class="topbar"><h1>✨ Noor Haven Admin</h1><button onclick="logout()">Logout</button></div>
+  <div class="tabs">
+    <div class="tab active" onclick="showTab('products',this)">Products</div>
+    <div class="tab" onclick="showTab('orders',this)">Orders</div>
+    <div class="tab" onclick="showTab('add',this)">Add Product</div>
+  </div>
+  <div class="content">
+    <div id="tab-products"><table><thead><tr><th>ID</th><th>Name</th><th>Category</th><th>Fabric</th><th>Price</th><th>Stock</th><th>Actions</th></tr></thead><tbody id="products-tbody"></tbody></table></div>
+    <div id="tab-orders" style="display:none"><table><thead><tr><th>Order#</th><th>Customer</th><th>Total</th><th>Payment</th><th>Status</th><th>Shipping</th><th>Update</th></tr></thead><tbody id="orders-tbody"></tbody></table></div>
+    <div id="tab-add" style="display:none">
+      <div class="form-grid">
+        <input id="p-name" placeholder="Product Name">
+        <select id="p-cat"><option>Formal</option><option>Party Wear</option><option>Bridal</option><option>Casual</option><option>Lawn</option><option>Festive</option><option>Eid</option></select>
+        <input id="p-fabric" placeholder="Fabric (e.g., Silk)">
+        <input id="p-color" placeholder="Color">
+        <input id="p-price" type="number" placeholder="Base Price (PKR)">
+        <input id="p-discount" type="number" placeholder="Discount Price (optional)">
+        <input id="p-image" placeholder="Image URL">
+        <textarea id="p-desc" placeholder="Description" rows="2"></textarea>
+        <input id="p-sizes" placeholder="Sizes (comma: XS,S,M,L,XL)" value="XS,S,M,L,XL">
+        <input id="p-stock" type="number" placeholder="Stock per size" value="5">
+        <button onclick="addProduct()">Add Product</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+let TOKEN=localStorage.getItem('admin_token');
+if(TOKEN){document.getElementById('login-screen').style.display='none';document.getElementById('dashboard').style.display='block';loadAll()}
+async function api(url,opt={}){if(TOKEN)opt.headers={...(opt.headers||{}),Authorization:'Bearer '+TOKEN};const r=await fetch(url,opt);return r.json()}
+async function adminLogin(){
+  const r=await api('/api/auth/admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});
+  if(r.token){TOKEN=r.token;localStorage.setItem('admin_token',TOKEN);document.getElementById('login-screen').style.display='none';document.getElementById('dashboard').style.display='block';loadAll()}
+  else alert('❌ Invalid admin credentials');
+}
+function logout(){localStorage.removeItem('admin_token');location.reload()}
+function showTab(name,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');['products','orders','add'].forEach(t=>document.getElementById('tab-'+t).style.display=t===name?'block':'none')}
+async function loadAll(){await loadProducts();await loadOrders()}
+async function loadProducts(){
+  const p=await api('/api/admin/products');
+  document.getElementById('products-tbody').innerHTML=p.map(x=>{
+    const stock=x.sizes.reduce((a,s)=>a+s.stock,0);
+    return `<tr><td>${x.id}</td><td>${x.name}</td><td>${x.category}</td><td>${x.fabric}</td><td>PKR ${(x.discount_price||x.base_price).toLocaleString()}</td><td>${stock}</td>
+    <td><button class="btn btn-del" onclick="delProd(${x.id})">Delete</button></td></tr>`;
+  }).join('');
+}
+async function loadOrders(){
+  const o=await api('/api/admin/orders');
+  document.getElementById('orders-tbody').innerHTML=o.map(x=>`<tr>
+    <td>${x.order_number}</td><td>${x.customer_name}</td><td>PKR ${x.total.toLocaleString()}</td><td>${x.payment_status}</td>
+    <td><select class="status" onchange="updateOrder(${x.id},'order_status',this.value)">
+      ${['Processing','Shipped','Delivered','Cancelled'].map(s=>`<option${s===x.order_status?' selected':''}>${s}</option>`).join('')}
+    </select></td>
+    <td><select class="status" onchange="updateOrder(${x.id},'shipping_status',this.value)">
+      ${['Not Shipped','In Transit','Delivered'].map(s=>`<option${s===x.shipping_status?' selected':''}>${s}</option>`).join('')}
+    </select></td>
+    <td>✓</td></tr>`).join('');
+}
+async function delProd(id){if(confirm('Delete?')){await api('/api/admin/products/'+id,{method:'DELETE'});loadProducts()}}
+async function updateOrder(id,field,val){
+  const cur=await api('/api/admin/orders');const o=cur.find(x=>x.id===id);
+  const body={order_status:o.order_status,shipping_status:o.shipping_status};body[field]=val;
+  await api('/api/admin/orders/'+id+'/status',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  alert('✅ Updated — chatbot will now reflect this!');
+}
+async function addProduct(){
+  const sizes=document.getElementById('p-sizes').value.split(',').map(s=>({size:s.trim(),stock:parseInt(document.getElementById('p-stock').value)}));
+  const r=await api('/api/admin/products',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    name:document.getElementById('p-name').value,category:document.getElementById('p-cat').value,
+    fabric:document.getElementById('p-fabric').value,color:document.getElementById('p-color').value,
+    base_price:parseFloat(document.getElementById('p-price').value),
+    discount_price:parseFloat(document.getElementById('p-discount').value)||null,
+    image:document.getElementById('p-image').value,description:document.getElementById('p-desc').value,sizes})});
+  if(r.success){alert('✅ Added! Chatbot can now see it.');loadProducts()}
+}
+</script></body></html>'''
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/admin')
+def admin():
+    return render_template_string(ADMIN_TEMPLATE)
+
+if __name__ == '__main__':
+    init_db()
+    print('🚀 Noor Haven running at http://localhost:5000')
+    print('👤 Customer login: ayesha@example.com / customer123')
+    print('🔐 Admin login: admin / admin123 (at /admin)')
+    app.run(debug=True, port=5000)
